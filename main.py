@@ -1,135 +1,215 @@
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from telethon.tl.types import InputPeerUser
 from flask import Flask, request, jsonify
-import asyncio, threading, os, json, time
+import asyncio, threading, os, json, time, traceback
 
-# ============================
-# Configuration
-# ============================
+# ======================================================
+# CONFIGURATION (HARDCODED FOR TESTING)
+# ======================================================
+
 API_ID = 33886333
 API_HASH = "979753e6fdb91479f7153d533788e87f"
-SESSION = "askplex_session"
-TARGET = InputPeerUser(user_id=8131321158, access_hash=7356519516453717310)
+
+SESSION_STRING = (
+    "1BVtsOL4BuyZpgmGfZ6xsw-VcDebep9dYVcwONPc9HOtu-xsn9ddAe2krvuuh0Z7MtZDjVluYRi"
+    "C3i7Yh0WpORXEQ2hp0MruOOUh-BbKu0-NXvUIkQbnlYl0yvN-SCtT8HJabHdT_R97gkgkq88k5mM"
+    "rHhPAb3hGOLBMMpfgvGk9ybRBHgW_kFJ2pth5uXKyg_rqJX4tuy_2Rb8iCIND0Dk46VsQy4-oS5j"
+    "Yq8YcXGnYjH3fSfmW5BZnrmxyIbT4CXu8mbgxIT5FE9UIdYLkAWS0B9MX4ZXkpbYwWYKsy_8bCGd"
+    "AA7ec6owt_FvPekOjSYxYOL40biRC2zbNYnMb_eJMhqMEtpyw="
+)
+
+TARGET = InputPeerUser(
+    user_id=8131321158,
+    access_hash=7356519516453717310
+)
+
+# ======================================================
+# FLASK APP
+# ======================================================
 
 app = Flask(__name__)
 
-# ============================
-# Asyncio Event Loop Setup
-# ============================
+# ======================================================
+# TELETHON + EVENT LOOP
+# ======================================================
+
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
-client = TelegramClient(SESSION, API_ID, API_HASH, loop=loop)
 
-# ============================
-# Global State
-# ============================
+client = TelegramClient(
+    StringSession(SESSION_STRING),
+    API_ID,
+    API_HASH,
+    loop=loop
+)
+
+# ======================================================
+# STATE
+# ======================================================
+
 latest_reply = {"reply": "", "timestamp": 0}
 reply_lock = threading.Lock()
 
-# ============================
-# Telegram Reply Listener
-# ============================
+# ======================================================
+# GLOBAL JSON-ERROR HANDLER (Important)
+# ======================================================
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    tb = traceback.format_exc()
+    print("\n🔥 GLOBAL ERROR:", tb)
+
+    return jsonify({
+        "ok": False,
+        "error": "internal_error",
+        "detail": str(e)
+    }), 500
+
+# ======================================================
+# TELEGRAM LISTENER — auto-catch replies
+# ======================================================
+
 @client.on(events.NewMessage(from_users=TARGET.user_id))
 async def handle_reply(event):
-    """Auto-catch bot replies"""
-    msg = event.raw_text.strip()
-    if msg.lower().startswith("thinking"):
-        return
-    
-    print(f"📩 Reply: {msg[:50]}...")
-    with reply_lock:
-        latest_reply["reply"] = msg
-        latest_reply["timestamp"] = time.time()
-    
     try:
+        msg = (event.raw_text or "").strip()
+        if not msg or msg.lower().startswith("thinking"):
+            return
+
+        print("📩 REPLY =>", msg)
+
+        with reply_lock:
+            latest_reply["reply"] = msg
+            latest_reply["timestamp"] = time.time()
+
         with open("reply.json", "w", encoding="utf-8") as f:
             json.dump(latest_reply, f, ensure_ascii=False)
-    except Exception as e:
-        print(f"Error: {e}")
 
-# ============================
-# Flask Routes
-# ============================
+    except Exception as e:
+        print("Listener Error:", traceback.format_exc())
+
+# ======================================================
+# ROUTES
+# ======================================================
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "status": "running"})
+    return jsonify({
+        "ok": True,
+        "status": "running",
+        "timestamp": time.time()
+    })
 
 @app.route("/send", methods=["POST"])
 def send_msg():
-    data = request.get_json(force=True) or {}
-    q = data.get("question", "").strip()
+    data = request.get_json(force=True, silent=True) or {}
+    q = (data.get("question") or "").strip()
+
     if not q:
-        return jsonify({"ok": False, "error": "Missing question"}), 400
-    
-    async def send_telegram():
+        return jsonify({"ok": False, "error": "missing_question"}), 400
+
+    async def _send():
         await client.send_message(TARGET, q)
-        print(f"✅ Sent: {q}")
-    
+        print("✅ SENT =>", q)
+
     try:
-        fut = asyncio.run_coroutine_threadsafe(send_telegram(), loop)
+        fut = asyncio.run_coroutine_threadsafe(_send(), loop)
         fut.result(timeout=20)
         return jsonify({"ok": True, "status": "sent"})
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "error": "send_failed", "detail": str(e)}), 500
 
 @app.route("/reply", methods=["GET"])
 def get_reply():
-    with reply_lock:
-        if not latest_reply.get("reply"):
-            try:
-                with open("reply.json", "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    return jsonify({"ok": True, "reply": data.get("reply", ""), "timestamp": data.get("timestamp", 0)})
-            except:
-                return jsonify({"ok": False, "error": "No reply yet"}), 404
-        return jsonify({"ok": True, "reply": latest_reply["reply"], "timestamp": latest_reply["timestamp"]})
+    try:
+        with reply_lock:
+            if latest_reply["reply"]:
+                return jsonify({
+                    "ok": True,
+                    "reply": latest_reply["reply"],
+                    "timestamp": latest_reply["timestamp"],
+                    "source": "memory"
+                })
+
+        if os.path.exists("reply.json"):
+            with open("reply.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return jsonify({
+                    "ok": True,
+                    "reply": data.get("reply", ""),
+                    "timestamp": data.get("timestamp", 0),
+                    "source": "file"
+                })
+
+        return jsonify({"ok": False, "error": "no_reply"}), 404
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": "reply_failed", "detail": str(e)}), 500
 
 @app.route("/fetch", methods=["GET"])
 def fetch_messages():
-    async def get_msg():
-        messages = await client.get_messages(TARGET, limit=10)
-        for msg in messages:
-            text = msg.message or ""
+    async def _fetch():
+        msgs = await client.get_messages(TARGET, limit=10)
+        for m in msgs:
+            text = (m.message or "").strip()
             if text and not text.lower().startswith("thinking"):
                 return text
         return None
-    
+
     try:
-        fut = asyncio.run_coroutine_threadsafe(get_msg(), loop)
-        reply_text = fut.result(timeout=15)
-        if reply_text:
+        fut = asyncio.run_coroutine_threadsafe(_fetch(), loop)
+        reply = fut.result(timeout=20)
+
+        if reply:
             with reply_lock:
-                latest_reply["reply"] = reply_text
+                latest_reply["reply"] = reply
                 latest_reply["timestamp"] = time.time()
-            return jsonify({"ok": True, "reply": reply_text})
+
+            with open("reply.json", "w", encoding="utf-8") as f:
+                json.dump(latest_reply, f, ensure_ascii=False)
+
+            return jsonify({"ok": True, "reply": reply})
+
         return jsonify({"ok": True, "status": "pending"})
+
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        print("Fetch Error:", traceback.format_exc())
+        return jsonify({"ok": False, "error": "fetch_error", "detail": str(e)}), 500
 
 @app.route("/clear", methods=["POST"])
-def clear():
+def clear_reply():
     with reply_lock:
         latest_reply["reply"] = ""
         latest_reply["timestamp"] = 0
+
     try:
-        os.remove("reply.json")
+        if os.path.exists("reply.json"):
+            os.remove("reply.json")
     except:
         pass
-    return jsonify({"ok": True})
 
-# ============================
-# Background Event Loop
-# ============================
+    return jsonify({"ok": True, "status": "cleared"})
+
+# ======================================================
+# EVENT LOOP THREAD
+# ======================================================
+
 def run_loop():
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
+# ======================================================
+# MAIN START
+# ======================================================
+
 if __name__ == "__main__":
-    print("🚀 Starting...")
+    print("🚀 STARTING SERVER…")
+
     threading.Thread(target=run_loop, daemon=True).start()
+
     asyncio.run_coroutine_threadsafe(client.start(), loop).result(timeout=30)
-    print("✅ Telegram connected")
-    
+    print("✅ TELEGRAM CONNECTED")
+
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
