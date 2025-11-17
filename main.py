@@ -2,10 +2,10 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import InputPeerUser
 from flask import Flask, request, jsonify
-import asyncio, threading, os, json, time, traceback
+import asyncio, threading, os, json, time, traceback, uvloop
 
 # ======================================================
-# CONFIGURATION (HARDCODED FOR TESTING)
+# TELETHON CONFIG
 # ======================================================
 
 API_ID = 33886333
@@ -25,17 +25,20 @@ TARGET = InputPeerUser(
 )
 
 # ======================================================
-# FLASK APP
+# APP + STATE
 # ======================================================
 
 app = Flask(__name__)
 
+latest_reply = {"reply": "", "timestamp": 0}
+reply_lock = threading.Lock()
+
 # ======================================================
-# TELETHON + EVENT LOOP
+# ASYNC LOOP (UVLOOP for SPEED)
 # ======================================================
 
+uvloop.install()
 loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
 
 client = TelegramClient(
     StringSession(SESSION_STRING),
@@ -45,140 +48,95 @@ client = TelegramClient(
 )
 
 # ======================================================
-# STATE
-# ======================================================
-
-latest_reply = {"reply": "", "timestamp": 0}
-reply_lock = threading.Lock()
-
-# ======================================================
-# GLOBAL JSON-ERROR HANDLER (Important)
+# GLOBAL ERROR HANDLER
 # ======================================================
 
 @app.errorhandler(Exception)
 def handle_exception(e):
-    tb = traceback.format_exc()
-    print("\n🔥 GLOBAL ERROR:", tb)
-
-    return jsonify({
-        "ok": False,
-        "error": "internal_error",
-        "detail": str(e)
-    }), 500
+    return jsonify({"ok": False, "error": str(e)}), 500
 
 # ======================================================
-# TELEGRAM LISTENER — auto-catch replies
+# TELEGRAM LISTENER
 # ======================================================
 
 @client.on(events.NewMessage(from_users=TARGET.user_id))
-async def handle_reply(event):
+async def on_message(event):
     try:
         msg = (event.raw_text or "").strip()
         if not msg or msg.lower().startswith("thinking"):
             return
 
-        print("📩 REPLY =>", msg)
-
         with reply_lock:
             latest_reply["reply"] = msg
             latest_reply["timestamp"] = time.time()
 
-        with open("reply.json", "w", encoding="utf-8") as f:
-            json.dump(latest_reply, f, ensure_ascii=False)
+        # Minimal file backup (non-blocking)
+        try:
+            with open("reply.json", "w", encoding="utf-8") as f:
+                json.dump(latest_reply, f)
+        except:
+            pass
 
-    except Exception as e:
+    except:
         print("Listener Error:", traceback.format_exc())
 
 # ======================================================
 # ROUTES
 # ======================================================
 
-@app.route("/", methods=["GET"])
-def health():
-    return jsonify({
-        "ok": True,
-        "status": "running",
-        "timestamp": time.time()
-    })
+@app.route("/warmup")
+def warmup():
+    """
+    Render pings this every 30s → keeps server alive.
+    """
+    return jsonify({"ok": True, "status": "alive", "t": time.time()})
+
+@app.route("/")
+def root():
+    return jsonify({"ok": True, "server": "running"})
 
 @app.route("/send", methods=["POST"])
-def send_msg():
-    data = request.get_json(force=True, silent=True) or {}
-    q = (data.get("question") or "").strip()
+def send():
+    data = request.json or {}
+    question = (data.get("question") or "").strip()
 
-    if not q:
-        return jsonify({"ok": False, "error": "missing_question"}), 400
+    if not question:
+        return jsonify({"ok": False, "error": "Question missing"}), 400
 
     async def _send():
-        await client.send_message(TARGET, q)
-        print("✅ SENT =>", q)
+        await client.send_message(TARGET, question)
 
     try:
-        fut = asyncio.run_coroutine_threadsafe(_send(), loop)
-        fut.result(timeout=20)
-        return jsonify({"ok": True, "status": "sent"})
+        asyncio.run_coroutine_threadsafe(_send(), loop)
+        return jsonify({"ok": True, "sent": question})
     except Exception as e:
-        return jsonify({"ok": False, "error": "send_failed", "detail": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.route("/reply", methods=["GET"])
 def get_reply():
-    try:
-        with reply_lock:
-            if latest_reply["reply"]:
-                return jsonify({
-                    "ok": True,
-                    "reply": latest_reply["reply"],
-                    "timestamp": latest_reply["timestamp"],
-                    "source": "memory"
-                })
+    with reply_lock:
+        if latest_reply["reply"]:
+            return jsonify({
+                "ok": True,
+                "reply": latest_reply["reply"],
+                "timestamp": latest_reply["timestamp"]
+            })
 
+    # fallback file
+    try:
         if os.path.exists("reply.json"):
             with open("reply.json", "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return jsonify({
-                    "ok": True,
-                    "reply": data.get("reply", ""),
-                    "timestamp": data.get("timestamp", 0),
-                    "source": "file"
-                })
+            return jsonify({"ok": True, "reply": data.get("reply", "")})
+    except:
+        pass
 
-        return jsonify({"ok": False, "error": "no_reply"}), 404
+    return jsonify({"ok": False, "error": "no_reply"}), 404
 
-    except Exception as e:
-        return jsonify({"ok": False, "error": "reply_failed", "detail": str(e)}), 500
-
-@app.route("/fetch", methods=["GET"])
-def fetch_messages():
-    async def _fetch():
-        msgs = await client.get_messages(TARGET, limit=10)
-        for m in msgs:
-            text = (m.message or "").strip()
-            if text and not text.lower().startswith("thinking"):
-                return text
-        return None
-
-    try:
-        fut = asyncio.run_coroutine_threadsafe(_fetch(), loop)
-        reply = fut.result(timeout=20)
-
-        if reply:
-            with reply_lock:
-                latest_reply["reply"] = reply
-                latest_reply["timestamp"] = time.time()
-
-            with open("reply.json", "w", encoding="utf-8") as f:
-                json.dump(latest_reply, f, ensure_ascii=False)
-
-            return jsonify({"ok": True, "reply": reply})
-
-        return jsonify({"ok": True, "status": "pending"})
-
-    except Exception as e:
-        print("Fetch Error:", traceback.format_exc())
-        return jsonify({"ok": False, "error": "fetch_error", "detail": str(e)}), 500
 
 @app.route("/clear", methods=["POST"])
-def clear_reply():
+def clear():
     with reply_lock:
         latest_reply["reply"] = ""
         latest_reply["timestamp"] = 0
@@ -191,25 +149,33 @@ def clear_reply():
 
     return jsonify({"ok": True, "status": "cleared"})
 
+
 # ======================================================
-# EVENT LOOP THREAD
+# LOOP THREAD
 # ======================================================
 
-def run_loop():
+def loop_thread():
+    """
+    Clean persistent event loop thread.
+    Never restarts, never blocks.
+    """
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
 # ======================================================
-# MAIN START
+# START SERVER
 # ======================================================
 
 if __name__ == "__main__":
-    print("🚀 STARTING SERVER…")
+    print("🚀 Starting Telegram Bot…")
 
-    threading.Thread(target=run_loop, daemon=True).start()
+    # Start async loop
+    threading.Thread(target=loop_thread, daemon=True).start()
 
-    asyncio.run_coroutine_threadsafe(client.start(), loop).result(timeout=30)
-    print("✅ TELEGRAM CONNECTED")
+    # Connect Telegram (non-blocking)
+    asyncio.run_coroutine_threadsafe(client.start(), loop)
+
+    print("✅ Telegram Connected")
 
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=port, debug=False)
