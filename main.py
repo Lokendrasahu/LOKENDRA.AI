@@ -5,7 +5,7 @@ from flask import Flask, request, jsonify
 import asyncio, threading, os, json, time, traceback
 
 # ======================================================
-# CONFIGURATION
+# CONFIGURATION (HARDCODED FOR TESTING)
 # ======================================================
 
 API_ID = 33886333
@@ -52,7 +52,7 @@ latest_reply = {"reply": "", "timestamp": 0}
 reply_lock = threading.Lock()
 
 # ======================================================
-# GLOBAL JSON ERROR HANDLER
+# GLOBAL JSON-ERROR HANDLER (Important)
 # ======================================================
 
 @app.errorhandler(Exception)
@@ -67,14 +67,13 @@ def handle_exception(e):
     }), 500
 
 # ======================================================
-# TELEGRAM LISTENER
+# TELEGRAM LISTENER — auto-catch replies
 # ======================================================
 
 @client.on(events.NewMessage(from_users=TARGET.user_id))
 async def handle_reply(event):
     try:
         msg = (event.raw_text or "").strip()
-
         if not msg or msg.lower().startswith("thinking"):
             return
 
@@ -87,7 +86,7 @@ async def handle_reply(event):
         with open("reply.json", "w", encoding="utf-8") as f:
             json.dump(latest_reply, f, ensure_ascii=False)
 
-    except Exception:
+    except Exception as e:
         print("Listener Error:", traceback.format_exc())
 
 # ======================================================
@@ -119,11 +118,7 @@ def send_msg():
         fut.result(timeout=20)
         return jsonify({"ok": True, "status": "sent"})
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": "send_failed",
-            "detail": str(e)
-        }), 500
+        return jsonify({"ok": False, "error": "send_failed", "detail": str(e)}), 500
 
 @app.route("/reply", methods=["GET"])
 def get_reply():
@@ -140,35 +135,27 @@ def get_reply():
         if os.path.exists("reply.json"):
             with open("reply.json", "r", encoding="utf-8") as f:
                 data = json.load(f)
-
-            return jsonify({
-                "ok": True,
-                "reply": data.get("reply", ""),
-                "timestamp": data.get("timestamp", 0),
-                "source": "file"
-            })
+                return jsonify({
+                    "ok": True,
+                    "reply": data.get("reply", ""),
+                    "timestamp": data.get("timestamp", 0),
+                    "source": "file"
+                })
 
         return jsonify({"ok": False, "error": "no_reply"}), 404
 
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": "reply_failed",
-            "detail": str(e)
-        }), 500
+        return jsonify({"ok": False, "error": "reply_failed", "detail": str(e)}), 500
 
 @app.route("/fetch", methods=["GET"])
 def fetch_messages():
 
     async def _fetch():
         msgs = await client.get_messages(TARGET, limit=10)
-
         for m in msgs:
             text = (m.message or "").strip()
-
             if text and not text.lower().startswith("thinking"):
                 return text
-
         return None
 
     try:
@@ -189,12 +176,7 @@ def fetch_messages():
 
     except Exception as e:
         print("Fetch Error:", traceback.format_exc())
-
-        return jsonify({
-            "ok": False,
-            "error": "fetch_error",
-            "detail": str(e)
-        }), 500
+        return jsonify({"ok": False, "error": "fetch_error", "detail": str(e)}), 500
 
 @app.route("/clear", methods=["POST"])
 def clear_reply():
@@ -227,7 +209,9 @@ if __name__ == "__main__":
 
     threading.Thread(target=run_loop, daemon=True).start()
 
-    asyncio.run_coroutine_threadsafe(client.start(), loop).result(timeout=30)
+    # FIXED ONLY THIS LINE:
+    asyncio.run_coroutine_threadsafe(client.connect(), loop).result(timeout=30)
+
     print("✅ TELEGRAM CONNECTED")
 
     port = int(os.environ.get("PORT", 10000))
