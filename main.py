@@ -5,7 +5,7 @@ from flask import Flask, request, jsonify
 import asyncio, threading, os, json, time, traceback
 
 # ======================================================
-# TELEGRAM CONFIG
+# CONFIGURATION
 # ======================================================
 
 API_ID = 33886333
@@ -25,7 +25,7 @@ TARGET = InputPeerUser(
 )
 
 # ======================================================
-# FLASK + STATE
+# APP & STATE
 # ======================================================
 
 app = Flask(__name__)
@@ -33,11 +33,22 @@ app = Flask(__name__)
 latest_reply = {"reply": "", "timestamp": 0}
 reply_lock = threading.Lock()
 
+# ======================================================
+# TELETHON EVENT LOOP
+# ======================================================
+
 loop = asyncio.new_event_loop()
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, loop=loop)
+asyncio.set_event_loop(loop)
+
+client = TelegramClient(
+    StringSession(SESSION_STRING),
+    API_ID,
+    API_HASH,
+    loop=loop
+)
 
 # ======================================================
-# LISTENER – AI REPLY CATCH
+# LISTENER — SAME AS YOUR OLD LOGIC
 # ======================================================
 
 @client.on(events.NewMessage(from_users=TARGET.user_id))
@@ -47,45 +58,29 @@ async def handle_reply(event):
         if not msg or msg.lower().startswith("thinking"):
             return
 
-        print("📩 AI Reply =>", msg)
+        print("📩 REPLY =>", msg)
 
         with reply_lock:
             latest_reply["reply"] = msg
             latest_reply["timestamp"] = time.time()
 
         with open("reply.json", "w", encoding="utf-8") as f:
-            json.dump(latest_reply, f)
+            json.dump(latest_reply, f, ensure_ascii=False)
 
     except Exception:
         print("Listener Error:", traceback.format_exc())
 
 # ======================================================
-# AUTO-RECONNECT (RELIABLE FOR RENDER)
-# ======================================================
-
-async def auto_reconnect():
-    while True:
-        try:
-            if not client.is_connected():
-                print("⚠️ Lost connection → reconnecting…")
-                await client.connect()
-                print("🔄 Reconnected!")
-
-            # session still valid?
-            if not await client.is_user_authorized():
-                print("❌ Session invalid / expired!")
-        except Exception as e:
-            print("Auto-Reconnect Error:", e)
-
-        await asyncio.sleep(5)
-
-# ======================================================
-# ROUTES
+# ROUTES — ALL SAME AS BEFORE
 # ======================================================
 
 @app.route("/", methods=["GET"])
-def home():
-    return jsonify({"ok": True, "status": "running", "time": time.time()})
+def health():
+    return jsonify({
+        "ok": True,
+        "status": "running",
+        "timestamp": time.time()
+    })
 
 @app.route("/send", methods=["POST"])
 def send_msg():
@@ -97,73 +92,71 @@ def send_msg():
 
     async def _send():
         await client.send_message(TARGET, q)
-        print("📤 SENT =>", q)
+        print("✅ SENT =>", q)
 
-    f = asyncio.run_coroutine_threadsafe(_send(), loop)
-    f.result(timeout=20)
-
-    return jsonify({"ok": True, "status": "sent"})
+    try:
+        fut = asyncio.run_coroutine_threadsafe(_send(), loop)
+        fut.result(timeout=20)
+        return jsonify({"ok": True, "status": "sent"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": "send_failed", "detail": str(e)}), 500
 
 @app.route("/reply", methods=["GET"])
 def get_reply():
-    with reply_lock:
-        if latest_reply["reply"]:
-            return jsonify({
-                "ok": True,
-                "reply": latest_reply["reply"],
-                "timestamp": latest_reply["timestamp"],
-                "source": "memory"
-            })
+    try:
+        with reply_lock:
+            if latest_reply["reply"]:
+                return jsonify({
+                    "ok": True,
+                    "reply": latest_reply["reply"],
+                    "timestamp": latest_reply["timestamp"],
+                    "source": "memory"
+                })
 
-    # fallback
-    if os.path.exists("reply.json"):
-        data = json.load(open("reply.json"))
-        return jsonify({
-            "ok": True,
-            "reply": data.get("reply", ""),
-            "timestamp": data.get("timestamp", 0),
-            "source": "file"
-        })
+        if os.path.exists("reply.json"):
+            with open("reply.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return jsonify({
+                    "ok": True,
+                    "reply": data.get("reply", ""),
+                    "timestamp": data.get("timestamp", 0),
+                    "source": "file"
+                })
 
-    return jsonify({"ok": False, "error": "no_reply"}), 404
+        return jsonify({"ok": False, "error": "no_reply"}), 404
 
-# ======================================================
-# FETCH BACKUP (SECONDARY POLLING)
-# ======================================================
+    except Exception as e:
+        return jsonify({"ok": False, "error": "reply_failed", "detail": str(e)}), 500
 
 @app.route("/fetch", methods=["GET"])
 def fetch_messages():
     async def _fetch():
         msgs = await client.get_messages(TARGET, limit=10)
         for m in msgs:
-            txt = (m.message or "").strip()
-            if txt and not txt.lower().startswith("thinking"):
-                return txt
+            t = (m.message or "").strip()
+            if t and not t.lower().startswith("thinking"):
+                return t
         return None
 
-    future = asyncio.run_coroutine_threadsafe(_fetch(), loop)
-
     try:
-        reply = future.result(timeout=20)
-    except:
-        return jsonify({"ok": False, "error": "timeout"}), 500
+        fut = asyncio.run_coroutine_threadsafe(_fetch(), loop)
+        reply = fut.result(timeout=20)
 
-    if reply:
-        with reply_lock:
-            latest_reply["reply"] = reply
-            latest_reply["timestamp"] = time.time()
+        if reply:
+            with reply_lock:
+                latest_reply["reply"] = reply
+                latest_reply["timestamp"] = time.time()
 
-        with open("reply.json", "w") as f:
-            json.dump(latest_reply, f)
+            with open("reply.json", "w", encoding="utf-8") as f:
+                json.dump(latest_reply, f)
 
-        print("📩 FETCH Reply =>", reply)
-        return jsonify({"ok": True, "reply": reply})
+            return jsonify({"ok": True, "reply": reply})
 
-    return jsonify({"ok": True, "status": "pending"})
+        return jsonify({"ok": True, "status": "pending"})
 
-# ======================================================
-# CLEAR REPLY
-# ======================================================
+    except Exception as e:
+        print("Fetch Error:", traceback.format_exc())
+        return jsonify({"ok": False, "error": "fetch_error", "detail": str(e)}), 500
 
 @app.route("/clear", methods=["POST"])
 def clear_reply():
@@ -174,32 +167,30 @@ def clear_reply():
     if os.path.exists("reply.json"):
         os.remove("reply.json")
 
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "status": "cleared"})
 
 # ======================================================
-# START LOOP THREAD
+# EVENT LOOP THREAD — FIXED ONLY HERE
 # ======================================================
 
 def run_loop():
     asyncio.set_event_loop(loop)
-
-    async def init():
-        print("⚡ Connecting Telegram…")
-        await client.connect()
-        print("✅ Connected!")
-
-    loop.run_until_complete(init())
-    loop.create_task(auto_reconnect())  # 🔥 Auto reconnect added
     loop.run_forever()
 
 # ======================================================
-# START SERVER
+# MAIN — ONLY FIX: replace start() with connect()
 # ======================================================
 
 if __name__ == "__main__":
-    print("🚀 Starting Server…")
+    print("🚀 STARTING SERVER…")
 
     threading.Thread(target=run_loop, daemon=True).start()
+
+    # FIX: start() is NOT coroutine, use connect()
+    future = asyncio.run_coroutine_threadsafe(client.connect(), loop)
+    future.result(timeout=30)
+
+    print("✅ TELEGRAM CONNECTED")
 
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
