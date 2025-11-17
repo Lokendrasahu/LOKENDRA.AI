@@ -25,7 +25,7 @@ TARGET = InputPeerUser(
 )
 
 # ======================================================
-# APP + STATE
+# FLASK + STATE
 # ======================================================
 
 app = Flask(__name__)
@@ -34,7 +34,7 @@ latest_reply = {"reply": "", "timestamp": 0}
 reply_lock = threading.Lock()
 
 # ======================================================
-# EVENT LOOP
+# EVENT LOOP + TELETHON CLIENT
 # ======================================================
 
 loop = asyncio.new_event_loop()
@@ -45,14 +45,6 @@ client = TelegramClient(
     API_HASH,
     loop=loop
 )
-
-# ======================================================
-# ERROR HANDLER
-# ======================================================
-
-@app.errorhandler(Exception)
-def handle_exception(e):
-    return jsonify({"ok": False, "error": str(e)}), 500
 
 # ======================================================
 # TELEGRAM LISTENER
@@ -69,9 +61,8 @@ async def on_message(event):
             latest_reply["reply"] = msg
             latest_reply["timestamp"] = time.time()
 
-        # backup to file
         try:
-            with open("reply.json", "w", encoding="utf-8") as f:
+            with open("reply.json", "w") as f:
                 json.dump(latest_reply, f)
         except:
             pass
@@ -83,39 +74,37 @@ async def on_message(event):
 # ROUTES
 # ======================================================
 
+@app.route("/")
+def home():
+    return jsonify({"ok": True, "status": "running"})
+
 @app.route("/warmup")
 def warmup():
-    return jsonify({"ok": True, "t": time.time()})
-
-@app.route("/")
-def root():
-    return jsonify({"ok": True, "status": "running"})
+    return jsonify({"ok": True, "time": time.time()})
 
 @app.route("/send", methods=["POST"])
 def send():
     data = request.json or {}
-    question = (data.get("question") or "").strip()
+    q = (data.get("question") or "").strip()
 
-    if not question:
+    if not q:
         return jsonify({"ok": False, "error": "missing_question"}), 400
 
     async def _send():
-        await client.send_message(TARGET, question)
+        await client.send_message(TARGET, q)
 
     asyncio.run_coroutine_threadsafe(_send(), loop)
-
-    return jsonify({"ok": True, "sent": question})
+    return jsonify({"ok": True, "sent": q})
 
 @app.route("/reply", methods=["GET"])
-def get_reply():
+def reply():
     with reply_lock:
         if latest_reply["reply"]:
             return jsonify(latest_reply)
 
-    # fallback file
     try:
         if os.path.exists("reply.json"):
-            with open("reply.json", "r", encoding="utf-8") as f:
+            with open("reply.json", "r") as f:
                 data = json.load(f)
             return jsonify(data)
     except:
@@ -130,19 +119,32 @@ def clear():
         latest_reply["timestamp"] = 0
 
     try:
-        if os.path.exists("reply.json"):
-            os.remove("reply.json")
+        os.remove("reply.json")
     except:
         pass
 
     return jsonify({"ok": True})
 
 # ======================================================
-# LOOP THREAD
+# EVENT LOOP THREAD
 # ======================================================
 
 def loop_thread():
+    """
+    Starts event loop and connects Telethon INSIDE the loop.
+    This is the correct pattern for Telethon 1.42+
+    """
     asyncio.set_event_loop(loop)
+
+    async def init():
+        print("⚡ Connecting Telegram Client...")
+        await client.connect()
+        if not await client.is_user_authorized():
+            print("❌ Session invalid or expired!")
+        else:
+            print("✅ Telegram Connected")
+
+    loop.run_until_complete(init())
     loop.run_forever()
 
 # ======================================================
@@ -150,12 +152,9 @@ def loop_thread():
 # ======================================================
 
 if __name__ == "__main__":
-    print("🚀 Starting Telegram Bot...")
+    print("🚀 Starting Telegram Bot…")
 
     threading.Thread(target=loop_thread, daemon=True).start()
-
-    asyncio.run_coroutine_threadsafe(client.start(), loop)
-    print("✅ Telegram Connected")
 
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
