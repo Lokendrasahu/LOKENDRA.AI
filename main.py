@@ -2,7 +2,7 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import InputPeerUser
 from flask import Flask, request, jsonify
-import asyncio, threading, os, json, time, traceback, uvloop
+import asyncio, threading, os, json, time, traceback
 
 # ======================================================
 # TELETHON CONFIG
@@ -34,10 +34,9 @@ latest_reply = {"reply": "", "timestamp": 0}
 reply_lock = threading.Lock()
 
 # ======================================================
-# ASYNC LOOP (UVLOOP for SPEED)
+# EVENT LOOP
 # ======================================================
 
-uvloop.install()
 loop = asyncio.new_event_loop()
 
 client = TelegramClient(
@@ -48,7 +47,7 @@ client = TelegramClient(
 )
 
 # ======================================================
-# GLOBAL ERROR HANDLER
+# ERROR HANDLER
 # ======================================================
 
 @app.errorhandler(Exception)
@@ -70,7 +69,7 @@ async def on_message(event):
             latest_reply["reply"] = msg
             latest_reply["timestamp"] = time.time()
 
-        # Minimal file backup (non-blocking)
+        # backup to file
         try:
             with open("reply.json", "w", encoding="utf-8") as f:
                 json.dump(latest_reply, f)
@@ -86,14 +85,11 @@ async def on_message(event):
 
 @app.route("/warmup")
 def warmup():
-    """
-    Render pings this every 30s → keeps server alive.
-    """
-    return jsonify({"ok": True, "status": "alive", "t": time.time()})
+    return jsonify({"ok": True, "t": time.time()})
 
 @app.route("/")
 def root():
-    return jsonify({"ok": True, "server": "running"})
+    return jsonify({"ok": True, "status": "running"})
 
 @app.route("/send", methods=["POST"])
 def send():
@@ -101,39 +97,31 @@ def send():
     question = (data.get("question") or "").strip()
 
     if not question:
-        return jsonify({"ok": False, "error": "Question missing"}), 400
+        return jsonify({"ok": False, "error": "missing_question"}), 400
 
     async def _send():
         await client.send_message(TARGET, question)
 
-    try:
-        asyncio.run_coroutine_threadsafe(_send(), loop)
-        return jsonify({"ok": True, "sent": question})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    asyncio.run_coroutine_threadsafe(_send(), loop)
 
+    return jsonify({"ok": True, "sent": question})
 
 @app.route("/reply", methods=["GET"])
 def get_reply():
     with reply_lock:
         if latest_reply["reply"]:
-            return jsonify({
-                "ok": True,
-                "reply": latest_reply["reply"],
-                "timestamp": latest_reply["timestamp"]
-            })
+            return jsonify(latest_reply)
 
     # fallback file
     try:
         if os.path.exists("reply.json"):
             with open("reply.json", "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return jsonify({"ok": True, "reply": data.get("reply", "")})
+            return jsonify(data)
     except:
         pass
 
     return jsonify({"ok": False, "error": "no_reply"}), 404
-
 
 @app.route("/clear", methods=["POST"])
 def clear():
@@ -147,34 +135,26 @@ def clear():
     except:
         pass
 
-    return jsonify({"ok": True, "status": "cleared"})
-
+    return jsonify({"ok": True})
 
 # ======================================================
 # LOOP THREAD
 # ======================================================
 
 def loop_thread():
-    """
-    Clean persistent event loop thread.
-    Never restarts, never blocks.
-    """
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
 # ======================================================
-# START SERVER
+# MAIN
 # ======================================================
 
 if __name__ == "__main__":
-    print("🚀 Starting Telegram Bot…")
+    print("🚀 Starting Telegram Bot...")
 
-    # Start async loop
     threading.Thread(target=loop_thread, daemon=True).start()
 
-    # Connect Telegram (non-blocking)
     asyncio.run_coroutine_threadsafe(client.start(), loop)
-
     print("✅ Telegram Connected")
 
     port = int(os.environ.get("PORT", 10000))
