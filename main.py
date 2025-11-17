@@ -25,7 +25,7 @@ TARGET = InputPeerUser(
 )
 
 # ======================================================
-# STATE + APP
+# FLASK + STATE
 # ======================================================
 
 app = Flask(__name__)
@@ -33,120 +33,136 @@ app = Flask(__name__)
 latest_reply = {"reply": "", "timestamp": 0}
 reply_lock = threading.Lock()
 
-# REAL event loop (Render-safe)
 loop = asyncio.new_event_loop()
-
-# TELETHON CLIENT
-client = TelegramClient(
-    StringSession(SESSION_STRING),
-    API_ID,
-    API_HASH,
-    loop=loop
-)
+client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, loop=loop)
 
 # ======================================================
-# LISTENER (PRIMARY REPLY CAPTURE)
+# LISTENER – AI REPLY CATCH
 # ======================================================
 
 @client.on(events.NewMessage(from_users=TARGET.user_id))
-async def on_ai_reply(event):
+async def handle_reply(event):
     try:
         msg = (event.raw_text or "").strip()
         if not msg or msg.lower().startswith("thinking"):
             return
 
+        print("📩 AI Reply =>", msg)
+
         with reply_lock:
             latest_reply["reply"] = msg
             latest_reply["timestamp"] = time.time()
 
-        # File backup
-        try:
-            with open("reply.json", "w", encoding="utf-8") as f:
-                json.dump(latest_reply, f)
-        except:
-            pass
-
-        print("📥 Listener Reply:", msg)
+        with open("reply.json", "w", encoding="utf-8") as f:
+            json.dump(latest_reply, f)
 
     except Exception:
         print("Listener Error:", traceback.format_exc())
 
 # ======================================================
+# AUTO-RECONNECT (RELIABLE FOR RENDER)
+# ======================================================
+
+async def auto_reconnect():
+    while True:
+        try:
+            if not client.is_connected():
+                print("⚠️ Lost connection → reconnecting…")
+                await client.connect()
+                print("🔄 Reconnected!")
+
+            # session still valid?
+            if not await client.is_user_authorized():
+                print("❌ Session invalid / expired!")
+        except Exception as e:
+            print("Auto-Reconnect Error:", e)
+
+        await asyncio.sleep(5)
+
+# ======================================================
 # ROUTES
 # ======================================================
 
-@app.route("/")
+@app.route("/", methods=["GET"])
 def home():
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "status": "running", "time": time.time()})
 
 @app.route("/send", methods=["POST"])
-def send_message():
-    data = request.get_json() or {}
+def send_msg():
+    data = request.get_json(force=True, silent=True) or {}
     q = (data.get("question") or "").strip()
+
     if not q:
         return jsonify({"ok": False, "error": "missing_question"}), 400
 
     async def _send():
         await client.send_message(TARGET, q)
+        print("📤 SENT =>", q)
 
-    asyncio.run_coroutine_threadsafe(_send(), loop)
+    f = asyncio.run_coroutine_threadsafe(_send(), loop)
+    f.result(timeout=20)
 
-    return jsonify({"ok": True, "sent": q})
+    return jsonify({"ok": True, "status": "sent"})
 
 @app.route("/reply", methods=["GET"])
 def get_reply():
     with reply_lock:
         if latest_reply["reply"]:
-            return jsonify(latest_reply)
+            return jsonify({
+                "ok": True,
+                "reply": latest_reply["reply"],
+                "timestamp": latest_reply["timestamp"],
+                "source": "memory"
+            })
 
-    try:
-        if os.path.exists("reply.json"):
-            return jsonify(json.load(open("reply.json", "r")))
-    except:
-        pass
+    # fallback
+    if os.path.exists("reply.json"):
+        data = json.load(open("reply.json"))
+        return jsonify({
+            "ok": True,
+            "reply": data.get("reply", ""),
+            "timestamp": data.get("timestamp", 0),
+            "source": "file"
+        })
 
     return jsonify({"ok": False, "error": "no_reply"}), 404
 
 # ======================================================
-# SECONDARY FALLBACK: /fetch (Telegram history scan)
+# FETCH BACKUP (SECONDARY POLLING)
 # ======================================================
 
 @app.route("/fetch", methods=["GET"])
-def fetch_history():
-    async def _scan():
+def fetch_messages():
+    async def _fetch():
         msgs = await client.get_messages(TARGET, limit=10)
         for m in msgs:
-            text = (m.message or "").strip()
-            if text and not text.lower().startswith("thinking"):
-                return text
+            txt = (m.message or "").strip()
+            if txt and not txt.lower().startswith("thinking"):
+                return txt
         return None
 
+    future = asyncio.run_coroutine_threadsafe(_fetch(), loop)
+
     try:
-        fut = asyncio.run_coroutine_threadsafe(_scan(), loop)
-        msg = fut.result(timeout=20)
+        reply = future.result(timeout=20)
+    except:
+        return jsonify({"ok": False, "error": "timeout"}), 500
 
-        if msg:
-            with reply_lock:
-                latest_reply["reply"] = msg
-                latest_reply["timestamp"] = time.time()
+    if reply:
+        with reply_lock:
+            latest_reply["reply"] = reply
+            latest_reply["timestamp"] = time.time()
 
-            # backup
-            try:
-                with open("reply.json", "w", encoding="utf-8") as f:
-                    json.dump(latest_reply, f)
-            except:
-                pass
+        with open("reply.json", "w") as f:
+            json.dump(latest_reply, f)
 
-            print("📥 FETCH Reply:", msg)
-            return jsonify({"ok": True, "reply": msg})
+        print("📩 FETCH Reply =>", reply)
+        return jsonify({"ok": True, "reply": reply})
 
-        return jsonify({"ok": True, "status": "waiting"})
-
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "status": "pending"})
 
 # ======================================================
-# CLEAR
+# CLEAR REPLY
 # ======================================================
 
 @app.route("/clear", methods=["POST"])
@@ -155,31 +171,25 @@ def clear_reply():
         latest_reply["reply"] = ""
         latest_reply["timestamp"] = 0
 
-    try:
-        if os.path.exists("reply.json"):
-            os.remove("reply.json")
-    except:
-        pass
+    if os.path.exists("reply.json"):
+        os.remove("reply.json")
 
     return jsonify({"ok": True})
 
 # ======================================================
-# TELETHON INIT (CORRECT MODERN WAY)
+# START LOOP THREAD
 # ======================================================
 
-def loop_thread():
+def run_loop():
     asyncio.set_event_loop(loop)
 
     async def init():
-        print("⚡ Connecting Telegram...")
+        print("⚡ Connecting Telegram…")
         await client.connect()
-
-        if not await client.is_user_authorized():
-            print("❌ Session invalid or expired.")
-        else:
-            print("✅ Telegram Ready")
+        print("✅ Connected!")
 
     loop.run_until_complete(init())
+    loop.create_task(auto_reconnect())  # 🔥 Auto reconnect added
     loop.run_forever()
 
 # ======================================================
@@ -187,9 +197,9 @@ def loop_thread():
 # ======================================================
 
 if __name__ == "__main__":
-    print("🚀 Booting Flask + Telegram…")
+    print("🚀 Starting Server…")
 
-    threading.Thread(target=loop_thread, daemon=True).start()
+    threading.Thread(target=run_loop, daemon=True).start()
 
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
